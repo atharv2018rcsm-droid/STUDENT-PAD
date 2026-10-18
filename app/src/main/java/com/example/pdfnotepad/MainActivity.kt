@@ -24,7 +24,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.horizontalScroll
@@ -119,7 +118,12 @@ fun PdfNotepadApp() {
     var showColorDialog by remember { mutableStateOf(false) }
     var canvasSize by remember { mutableStateOf(IntSize(1, 1)) }
 
-    // Scribble-to-Text Dialog State (Works with Gboard Handwriting / Stylus Write-in-Text-Field)
+    // Always-updated state references for inside pointerInput gesture loop
+    val currentZoomScale by rememberUpdatedState(zoomScale)
+    val currentPanOffset by rememberUpdatedState(panOffset)
+    val currentCanvasSize by rememberUpdatedState(canvasSize)
+
+    // Scribble-to-Text Dialog State
     var pendingTextOffset by remember { mutableStateOf<Offset?>(null) }
     var scribbleInputText by remember { mutableStateOf("") }
 
@@ -175,7 +179,7 @@ fun PdfNotepadApp() {
         Color(0xFF43A047), // Green
         Color(0xFFFB8C00), // Orange
         Color(0xFF8E24AA), // Purple
-        Color(0xFFFDD835)  // Highlighter Yellow
+        Color(0xFFFDD835) // Highlighter Yellow
     )
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -223,7 +227,7 @@ fun PdfNotepadApp() {
                 OutlinedButton(onClick = {
                     zoomScale = (zoomScale - 0.25f).coerceIn(1f, 5f)
                     if (zoomScale == 1f) panOffset = Offset.Zero
-                }) { Text("🔍 -") }
+                }) { Text("Zoom -") }
 
                 TextButton(onClick = {
                     zoomScale = 1f
@@ -232,7 +236,7 @@ fun PdfNotepadApp() {
 
                 OutlinedButton(onClick = {
                     zoomScale = (zoomScale + 0.25f).coerceIn(1f, 5f)
-                }) { Text("🔍 +") }
+                }) { Text("Zoom +") }
 
                 Button(
                     onClick = { savePdfLauncher.launch("Annotated_Notes.pdf") },
@@ -257,35 +261,35 @@ fun PdfNotepadApp() {
                 FilterChip(
                     selected = activeTool == ActiveTool.SCROLL_POINTER,
                     onClick = { activeTool = ActiveTool.SCROLL_POINTER },
-                    label = { Text("👆 Pointer (Scroll/Zoom)") }
+                    label = { Text("Pointer (Scroll)") }
                 )
 
                 // 2. Pen Mode
                 FilterChip(
                     selected = activeTool == ActiveTool.PEN,
                     onClick = { activeTool = ActiveTool.PEN },
-                    label = { Text("✏️ Pen") }
+                    label = { Text("Pen") }
                 )
 
                 // 3. Good Handwriting (Auto-Smooth & Calligraphy) Toggle
                 FilterChip(
                     selected = neatHandwritingMode,
                     onClick = { neatHandwritingMode = !neatHandwritingMode },
-                    label = { Text("✨ Neat Handwriting") }
+                    label = { Text("Neat Write") }
                 )
 
                 // 4. Scribble to Neat Text Stamp
                 FilterChip(
                     selected = activeTool == ActiveTool.SCRIBBLE_TEXT,
                     onClick = { activeTool = ActiveTool.SCRIBBLE_TEXT },
-                    label = { Text("🔤 Scribble to Text") }
+                    label = { Text("Scribble Text") }
                 )
 
                 // 5. Eraser Mode
                 FilterChip(
                     selected = activeTool == ActiveTool.ERASER,
                     onClick = { activeTool = ActiveTool.ERASER },
-                    label = { Text("🧹 Eraser") }
+                    label = { Text("Eraser") }
                 )
 
                 OutlinedButton(
@@ -368,88 +372,88 @@ fun PdfNotepadApp() {
                     value = currentSize,
                     onValueChange = { currentSize = it },
                     valueRange = 2f..50f,
-                    modifier = Modifier.width(160.dp)
+                    modifier = Modifier.width(150.dp)
                 )
             }
         }
 
-        // MAIN CANVAS: Supports 1-Finger Pointer Scroll, 2-Finger Pinch Zoom/Pan, and Smooth Bezier Drawing
+        // MAIN CANVAS: Outer container captures gestures so coordinates never jump while zooming!
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .background(Color(0xFFCCCCCC))
                 .padding(8.dp)
-                .clipToBounds(),
-            contentAlignment = Alignment.Center
-        ) {
-            val activeBitmap = pageBitmaps.getOrNull(currentPageIndex)
-            if (activeBitmap != null) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(Color.White)
-                        .onSizeChanged { canvasSize = it }
-                        .pointerInput(currentPageIndex, activeTool, currentColor, currentSize, neatHandwritingMode) {
-                            awaitEachGesture {
-                                val firstDown = awaitFirstDown(requireUnconsumed = false)
+                .clipToBounds()
+                .onSizeChanged { canvasSize = it }
+                .pointerInput(currentPageIndex, activeTool, currentColor, currentSize, neatHandwritingMode) {
+                    awaitEachGesture {
+                        val firstDown = awaitFirstDown(requireUnconsumed = false)
 
-                                // If user selected SCRIBBLE_TEXT, tapping places a neat handwriting/text box at that exact PDF spot
-                                if (activeTool == ActiveTool.SCRIBBLE_TEXT) {
-                                    val unscaledPos = screenToCanvasPoint(
-                                        screenPt = firstDown.position,
-                                        canvasSize = canvasSize,
-                                        scale = zoomScale,
-                                        offset = panOffset
-                                    )
-                                    pendingTextOffset = unscaledPos
-                                    scribbleInputText = ""
-                                    return@awaitEachGesture
+                        if (activeTool == ActiveTool.SCRIBBLE_TEXT) {
+                            val unscaledPos = screenToCanvasPoint(
+                                screenPt = firstDown.position,
+                                canvasSize = currentCanvasSize,
+                                scale = currentZoomScale,
+                                offset = currentPanOffset
+                            )
+                            pendingTextOffset = unscaledPos
+                            scribbleInputText = ""
+                            return@awaitEachGesture
+                        }
+
+                        var isMultiTouchZooming = false
+                        val activeDrawPoints = mutableListOf<DrawPoint>()
+
+                        if (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER) {
+                            val startPt = screenToCanvasPoint(
+                                screenPt = firstDown.position,
+                                canvasSize = currentCanvasSize,
+                                scale = currentZoomScale,
+                                offset = currentPanOffset
+                            )
+                            activeDrawPoints.add(DrawPoint(startPt.x, startPt.y))
+                            currentPoints = activeDrawPoints.toList()
+                        }
+
+                        do {
+                            val event = awaitPointerEvent()
+                            val pressedCount = event.changes.count { it.pressed }
+
+                            if (pressedCount >= 2 || activeTool == ActiveTool.SCROLL_POINTER) {
+                                if (pressedCount >= 2) {
+                                    isMultiTouchZooming = true
+                                    activeDrawPoints.clear()
+                                    currentPoints = emptyList()
                                 }
 
-                                var isMultiTouchZooming = false
-                                var activeDrawPoints = mutableListOf<DrawPoint>()
+                                val zoomChange = event.calculateZoom()
+                                val panChange = event.calculatePan()
 
-                                if (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER) {
-                                    val startPt = screenToCanvasPoint(
-                                        screenPt = firstDown.position,
-                                        canvasSize = canvasSize,
-                                        scale = zoomScale,
-                                        offset = panOffset
+                                val newScale = (currentZoomScale * zoomChange).coerceIn(1f, 5f)
+                                val maxPanX = (currentCanvasSize.width * (newScale - 1f)) / 2f
+                                val maxPanY = (currentCanvasSize.height * (newScale - 1f)) / 2f
+
+                                zoomScale = newScale
+                                panOffset = Offset(
+                                    x = (currentPanOffset.x + panChange.x).coerceIn(-maxPanX, maxPanX),
+                                    y = (currentPanOffset.y + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                )
+
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            } else if (pressedCount == 1 && !isMultiTouchZooming &&
+                                (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER)
+                            ) {
+                                val change = event.changes.firstOrNull { it.pressed }
+                                if (change != null && change.positionChanged()) {
+                                    val pt = screenToCanvasPoint(
+                                        screenPt = change.position,
+                                        canvasSize = currentCanvasSize,
+                                        scale = currentZoomScale,
+                                        offset = currentPanOffset
                                     )
-                                    activeDrawPoints.add(DrawPoint(startPt.x, startPt.y))
-                                    currentPoints = activeDrawPoints.toList()
-                                }
-
-                                do {
-                                    val event = awaitPointerEvent()
-                                    val pressedCount = event.changes.count { it.pressed }
-
-                                    if (pressedCount >= 2 || activeTool == ActiveTool.SCROLL_POINTER) {
-                                        // Either 2+ fingers are on screen OR user is in "Only Pointer to Scroll" mode!
-                                        if (pressedCount >= 2) {
-                                            isMultiTouchZooming = true
-                                            // Cancel any accidental 1-finger dot started right before 2nd finger touched
-                                            activeDrawPoints.clear()
-                                            currentPoints = emptyList()
-                                        }
-
-                                        val zoomChange = event.calculateZoom()
-                                        val panChange = event.calculatePan()
-
-                                        val newScale = (zoomScale * zoomChange).coerceIn(1f, 5f)
-                                        val maxPanX = (canvasSize.width * (newScale - 1f)) / 2f
-                                        val maxPanY = (canvasSize.height * (newScale - 1f)) / 2f
-
-                                        zoomScale = newScale
-                                        panOffset = Offset(
-                                            x = (panOffset.x + panChange.x).coerceIn(-maxPanX, maxPanX),
-                                            y = (panOffset.y + panChange.y).coerceIn(-maxPanY, maxPanY)
-                                        )
-
-                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                    } else if (pressedCount == 1 && !isMultiTouchZooming &&
-                                        (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER)
-                                    ) {
-                                        val change = event.changes.firstOrNull {
+                                    val last = activeDrawPoints.lastOrNull()
+                                    val minDistance = if (neatHandwritingMode) 3.0f / currentZoomScale else 1f
+                                    if (last == null || abs(pt.x - last.x) > minDistance || abs(pt.y - last.y) > minDistance) {
+                                        activeDrawPoints.add(DrawPoint(pt.x, pt.y))
+                                        currentPoints = activeDrawPoints.toList()
