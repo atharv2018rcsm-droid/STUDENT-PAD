@@ -7,6 +7,7 @@ import android.graphics.Color as AndroidColor
 import android.graphics.Paint as AndroidPaint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
@@ -21,7 +22,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -32,10 +37,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -43,6 +51,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.abs
+
+enum class ActiveTool {
+    PEN,
+    ERASER,
+    SCROLL_POINTER,
+    SCRIBBLE_TEXT
+}
 
 data class DrawPoint(val x: Float, val y: Float)
 
@@ -50,7 +66,16 @@ data class InkStroke(
     val points: List<DrawPoint>,
     val color: Color,
     val strokeWidth: Float,
-    val isEraser: Boolean = false
+    val isEraser: Boolean = false,
+    val isNeatCalligraphy: Boolean = true
+)
+
+data class TextNoteItem(
+    val text: String,
+    val x: Float,
+    val y: Float,
+    val color: Color,
+    val fontSize: Float
 )
 
 class MainActivity : ComponentActivity() {
@@ -70,29 +95,38 @@ class MainActivity : ComponentActivity() {
 fun PdfNotepadApp() {
     val context = LocalContext.current
 
-    // Multi-page state: Either imported PDF pages or blank notepad pages
+    // Multi-page state
     val pageBitmaps = remember { mutableStateListOf<Bitmap>(createBlankPageBitmap()) }
     var currentPageIndex by remember { mutableIntStateOf(0) }
 
-    // Per-page Undo and Redo stroke stacks
+    // Per-page Undo & Redo stroke stacks
     val pageStrokes = remember { mutableStateMapOf<Int, MutableList<InkStroke>>() }
     val pageRedoStacks = remember { mutableStateMapOf<Int, MutableList<InkStroke>>() }
+    val pageTextNotes = remember { mutableStateMapOf<Int, MutableList<TextNoteItem>>() }
 
     // Current active stroke points
     var currentPoints by remember { mutableStateOf<List<DrawPoint>>(emptyList()) }
 
-    // Pen & Eraser Settings
+    // Zoom & Scroll State (Per Page)
+    var zoomScale by remember(currentPageIndex) { mutableFloatStateOf(1f) }
+    var panOffset by remember(currentPageIndex) { mutableStateOf(Offset.Zero) }
+
+    // Tool & Pen Settings
+    var activeTool by remember { mutableStateOf(ActiveTool.PEN) }
+    var neatHandwritingMode by remember { mutableStateOf(true) }
     var currentColor by remember { mutableStateOf(Color(0xFF1E88E5)) }
     var currentSize by remember { mutableFloatStateOf(8f) }
-    var isEraser by remember { mutableStateOf(false) }
     var showColorDialog by remember { mutableStateOf(false) }
     var canvasSize by remember { mutableStateOf(IntSize(1, 1)) }
 
-    // Helper to get strokes for current page
+    // Scribble-to-Text Dialog State (Works with Gboard Handwriting / Stylus Write-in-Text-Field)
+    var pendingTextOffset by remember { mutableStateOf<Offset?>(null) }
+    var scribbleInputText by remember { mutableStateOf("") }
+
     val currentStrokes = pageStrokes.getOrPut(currentPageIndex) { mutableStateListOf() }
     val currentRedo = pageRedoStacks.getOrPut(currentPageIndex) { mutableStateListOf() }
+    val currentTexts = pageTextNotes.getOrPut(currentPageIndex) { mutableStateListOf() }
 
-    // File Picker to Open PDF
     val openPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -103,7 +137,10 @@ fun PdfNotepadApp() {
                 pageBitmaps.addAll(loadedPages)
                 pageStrokes.clear()
                 pageRedoStacks.clear()
+                pageTextNotes.clear()
                 currentPageIndex = 0
+                zoomScale = 1f
+                panOffset = Offset.Zero
                 Toast.makeText(context, "Loaded ${loadedPages.size} PDF page(s)", Toast.LENGTH_SHORT).show()
             } else {
                 Toast.makeText(context, "Could not read PDF file", Toast.LENGTH_SHORT).show()
@@ -111,7 +148,6 @@ fun PdfNotepadApp() {
         }
     }
 
-    // File Saver to Export Annotated PDF
     val savePdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { uri: Uri? ->
@@ -121,6 +157,7 @@ fun PdfNotepadApp() {
                 destUri = it,
                 pageBitmaps = pageBitmaps,
                 pageStrokes = pageStrokes,
+                pageTextNotes = pageTextNotes,
                 canvasSize = canvasSize
             )
             if (success) {
@@ -142,7 +179,7 @@ fun PdfNotepadApp() {
     )
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // TOP BAR: Open PDF, New Blank Page, Page Navigation, Save PDF
+        // TOP BAR: Open PDF, New Blank Page, Page Navigation, Zoom Controls, Save PDF
         Surface(tonalElevation = 4.dp, shadowElevation = 4.dp, modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier
@@ -182,6 +219,21 @@ fun PdfNotepadApp() {
                     ) { Text("Next >") }
                 }
 
+                // Quick Zoom Out / Reset / Zoom In Buttons
+                OutlinedButton(onClick = {
+                    zoomScale = (zoomScale - 0.25f).coerceIn(1f, 5f)
+                    if (zoomScale == 1f) panOffset = Offset.Zero
+                }) { Text("🔍 -") }
+
+                TextButton(onClick = {
+                    zoomScale = 1f
+                    panOffset = Offset.Zero
+                }) { Text("${(zoomScale * 100).toInt()}%") }
+
+                OutlinedButton(onClick = {
+                    zoomScale = (zoomScale + 0.25f).coerceIn(1f, 5f)
+                }) { Text("🔍 +") }
+
                 Button(
                     onClick = { savePdfLauncher.launch("Annotated_Notes.pdf") },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
@@ -191,7 +243,7 @@ fun PdfNotepadApp() {
             }
         }
 
-        // SECOND BAR: Undo, Redo, Pen, Eraser, Quick Colors + All Colors Button
+        // SECOND BAR: Pointer/Scroll Mode, Pen, Good Handwriting Smoothing, Scribble-to-Text, Eraser, Undo/Redo, Colors
         Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier
@@ -201,14 +253,51 @@ fun PdfNotepadApp() {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                // 1. Pointer / Scroll Only Mode
+                FilterChip(
+                    selected = activeTool == ActiveTool.SCROLL_POINTER,
+                    onClick = { activeTool = ActiveTool.SCROLL_POINTER },
+                    label = { Text("👆 Pointer (Scroll/Zoom)") }
+                )
+
+                // 2. Pen Mode
+                FilterChip(
+                    selected = activeTool == ActiveTool.PEN,
+                    onClick = { activeTool = ActiveTool.PEN },
+                    label = { Text("✏️ Pen") }
+                )
+
+                // 3. Good Handwriting (Auto-Smooth & Calligraphy) Toggle
+                FilterChip(
+                    selected = neatHandwritingMode,
+                    onClick = { neatHandwritingMode = !neatHandwritingMode },
+                    label = { Text("✨ Neat Handwriting") }
+                )
+
+                // 4. Scribble to Neat Text Stamp
+                FilterChip(
+                    selected = activeTool == ActiveTool.SCRIBBLE_TEXT,
+                    onClick = { activeTool = ActiveTool.SCRIBBLE_TEXT },
+                    label = { Text("🔤 Scribble to Text") }
+                )
+
+                // 5. Eraser Mode
+                FilterChip(
+                    selected = activeTool == ActiveTool.ERASER,
+                    onClick = { activeTool = ActiveTool.ERASER },
+                    label = { Text("🧹 Eraser") }
+                )
+
                 OutlinedButton(
                     onClick = {
                         if (currentStrokes.isNotEmpty()) {
                             val removed = currentStrokes.removeAt(currentStrokes.lastIndex)
                             currentRedo.add(removed)
+                        } else if (currentTexts.isNotEmpty()) {
+                            currentTexts.removeAt(currentTexts.lastIndex)
                         }
                     },
-                    enabled = currentStrokes.isNotEmpty()
+                    enabled = currentStrokes.isNotEmpty() || currentTexts.isNotEmpty()
                 ) { Text("Undo") }
 
                 OutlinedButton(
@@ -221,18 +310,6 @@ fun PdfNotepadApp() {
                     enabled = currentRedo.isNotEmpty()
                 ) { Text("Redo") }
 
-                FilterChip(
-                    selected = !isEraser,
-                    onClick = { isEraser = false },
-                    label = { Text("Pen") }
-                )
-
-                FilterChip(
-                    selected = isEraser,
-                    onClick = { isEraser = true },
-                    label = { Text("Eraser") }
-                )
-
                 // Preset Color Circles
                 presetColors.forEach { color ->
                     Box(
@@ -241,18 +318,17 @@ fun PdfNotepadApp() {
                             .clip(CircleShape)
                             .background(color)
                             .border(
-                                width = if (currentColor == color && !isEraser) 3.dp else 1.dp,
-                                color = if (currentColor == color && !isEraser) Color.Black else Color.Gray,
+                                width = if (currentColor == color && activeTool != ActiveTool.ERASER) 3.dp else 1.dp,
+                                color = if (currentColor == color && activeTool != ActiveTool.ERASER) Color.Black else Color.Gray,
                                 shape = CircleShape
                             )
                             .clickable {
                                 currentColor = color
-                                isEraser = false
+                                if (activeTool == ActiveTool.ERASER) activeTool = ActiveTool.PEN
                             }
                     )
                 }
 
-                // Custom RGB Color Picker Button
                 OutlinedButton(onClick = { showColorDialog = true }) {
                     Box(
                         modifier = Modifier
@@ -266,35 +342,45 @@ fun PdfNotepadApp() {
             }
         }
 
-        // THIRD BAR: Pen / Eraser Size Slider
+        // THIRD BAR: Size Slider + Helpful Mode Hint
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background( Color(0xFFF5F5F5) )
+                .background(Color(0xFFF5F5F5))
                 .padding(horizontal = 16.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val modeText = when (activeTool) {
+                ActiveTool.SCROLL_POINTER -> "Pointer Mode: Drag 1 finger to scroll, pinch 2 fingers to zoom"
+                ActiveTool.SCRIBBLE_TEXT -> "Tap anywhere on PDF to scribble/write neat text (${(currentSize * 3).toInt()}pt)"
+                ActiveTool.ERASER -> "Eraser Size: ${currentSize.toInt()}px (2 fingers to scroll/zoom)"
+                ActiveTool.PEN -> "Pen Size: ${currentSize.toInt()}px (2 fingers to scroll/zoom)"
+            }
             Text(
-                text = if (isEraser) "Eraser Size: ${currentSize.toInt()}px" else "Pen Size: ${currentSize.toInt()}px",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Slider(
-                value = currentSize,
-                onValueChange = { currentSize = it },
-                valueRange = 2f..60f,
+                text = modeText,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
                 modifier = Modifier.weight(1f)
             )
+            if (activeTool != ActiveTool.SCROLL_POINTER) {
+                Spacer(modifier = Modifier.width(8.dp))
+                Slider(
+                    value = currentSize,
+                    onValueChange = { currentSize = it },
+                    valueRange = 2f..50f,
+                    modifier = Modifier.width(160.dp)
+                )
+            }
         }
 
-        // MAIN CANVAS: PDF Page + Drawing Layer
+        // MAIN CANVAS: Supports 1-Finger Pointer Scroll, 2-Finger Pinch Zoom/Pan, and Smooth Bezier Drawing
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .background(Color(0xFFCCCCCC))
-                .padding(8.dp),
+                .padding(8.dp)
+                .clipToBounds(),
             contentAlignment = Alignment.Center
         ) {
             val activeBitmap = pageBitmaps.getOrNull(currentPageIndex)
@@ -305,237 +391,65 @@ fun PdfNotepadApp() {
                         .clip(RoundedCornerShape(4.dp))
                         .background(Color.White)
                         .onSizeChanged { canvasSize = it }
-                ) {
-                    Image(
-                        bitmap = activeBitmap.asImageBitmap(),
-                        contentDescription = "PDF Page",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                        .pointerInput(currentPageIndex, activeTool, currentColor, currentSize, neatHandwritingMode) {
+                            awaitEachGesture {
+                                val firstDown = awaitFirstDown(requireUnconsumed = false)
 
-                    Canvas(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
-                            .pointerInput(currentPageIndex, isEraser, currentColor, currentSize) {
-                                detectDragGestures(
-                                    onDragStart = { offset ->
-                                        currentRedo.clear()
-                                        currentPoints = listOf(DrawPoint(offset.x, offset.y))
-                                    },
-                                    onDrag = { change, _ ->
-                                        change.consume()
-                                        currentPoints = currentPoints + DrawPoint(change.position.x, change.position.y)
-                                    },
-                                    onDragEnd = {
-                                        if (currentPoints.isNotEmpty()) {
-                                            currentStrokes.add(
-                                                InkStroke(
-                                                    points = currentPoints,
-                                                    color = currentColor,
-                                                    strokeWidth = currentSize,
-                                                    isEraser = isEraser
-                                                )
-                                            )
+                                // If user selected SCRIBBLE_TEXT, tapping places a neat handwriting/text box at that exact PDF spot
+                                if (activeTool == ActiveTool.SCRIBBLE_TEXT) {
+                                    val unscaledPos = screenToCanvasPoint(
+                                        screenPt = firstDown.position,
+                                        canvasSize = canvasSize,
+                                        scale = zoomScale,
+                                        offset = panOffset
+                                    )
+                                    pendingTextOffset = unscaledPos
+                                    scribbleInputText = ""
+                                    return@awaitEachGesture
+                                }
+
+                                var isMultiTouchZooming = false
+                                var activeDrawPoints = mutableListOf<DrawPoint>()
+
+                                if (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER) {
+                                    val startPt = screenToCanvasPoint(
+                                        screenPt = firstDown.position,
+                                        canvasSize = canvasSize,
+                                        scale = zoomScale,
+                                        offset = panOffset
+                                    )
+                                    activeDrawPoints.add(DrawPoint(startPt.x, startPt.y))
+                                    currentPoints = activeDrawPoints.toList()
+                                }
+
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pressedCount = event.changes.count { it.pressed }
+
+                                    if (pressedCount >= 2 || activeTool == ActiveTool.SCROLL_POINTER) {
+                                        // Either 2+ fingers are on screen OR user is in "Only Pointer to Scroll" mode!
+                                        if (pressedCount >= 2) {
+                                            isMultiTouchZooming = true
+                                            // Cancel any accidental 1-finger dot started right before 2nd finger touched
+                                            activeDrawPoints.clear()
                                             currentPoints = emptyList()
                                         }
-                                    }
-                                )
-                            }
-                    ) {
-                        // Draw finished strokes for this page
-                        currentStrokes.forEach { stroke ->
-                            drawStrokePoints(stroke.points, stroke.color, stroke.strokeWidth, stroke.isEraser)
-                        }
-                        // Draw stroke currently in progress
-                        if (currentPoints.isNotEmpty()) {
-                            drawStrokePoints(currentPoints, currentColor, currentSize, isEraser)
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    if (showColorDialog) {
-        FullColorPickerDialog(
-            initialColor = currentColor,
-            onColorSelected = {
-                currentColor = it
-                isEraser = false
-                showColorDialog = false
-            },
-            onDismiss = { showColorDialog = false }
-        )
-    }
-}
+                                        val zoomChange = event.calculateZoom()
+                                        val panChange = event.calculatePan()
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawStrokePoints(
-    points: List<DrawPoint>,
-    color: Color,
-    strokeWidth: Float,
-    isEraser: Boolean
-) {
-    if (points.isEmpty()) return
-    val path = Path().apply {
-        moveTo(points.first().x, points.first().y)
-        for (i in 1 until points.size) {
-            lineTo(points[i].x, points[i].y)
-        }
-    }
-    drawPath(
-        path = path,
-        color = if (isEraser) Color.Transparent else color,
-        style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round),
-        blendMode = if (isEraser) BlendMode.Clear else BlendMode.SrcOver
-    )
-}
+                                        val newScale = (zoomScale * zoomChange).coerceIn(1f, 5f)
+                                        val maxPanX = (canvasSize.width * (newScale - 1f)) / 2f
+                                        val maxPanY = (canvasSize.height * (newScale - 1f)) / 2f
 
-@Composable
-fun FullColorPickerDialog(
-    initialColor: Color,
-    onColorSelected: (Color) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var red by remember { mutableFloatStateOf(initialColor.red) }
-    var green by remember { mutableFloatStateOf(initialColor.green) }
-    var blue by remember { mutableFloatStateOf(initialColor.blue) }
-    var alpha by remember { mutableFloatStateOf(initialColor.alpha) }
-    val previewColor = Color(red, green, blue, alpha)
+                                        zoomScale = newScale
+                                        panOffset = Offset(
+                                            x = (panOffset.x + panChange.x).coerceIn(-maxPanX, maxPanX),
+                                            y = (panOffset.y + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                        )
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Custom Pen Color & Opacity") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(previewColor)
-                        .border(1.dp, Color.Gray, RoundedCornerShape(8.dp))
-                )
-                Text("Red: ${(red * 255).toInt()}")
-                Slider(value = red, onValueChange = { red = it })
-                Text("Green: ${(green * 255).toInt()}")
-                Slider(value = green, onValueChange = { green = it })
-                Text("Blue: ${(blue * 255).toInt()}")
-                Slider(value = blue, onValueChange = { blue = it })
-                Text("Opacity (Highlighter mode): ${(alpha * 100).toInt()}%")
-                Slider(value = alpha, onValueChange = { alpha = it }, valueRange = 0.2f..1f)
-            }
-        },
-        confirmButton = {
-            Button(onClick = { onColorSelected(previewColor) }) { Text("Use Color") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        }
-    )
-}
-
-fun createBlankPageBitmap(width: Int = 1200, height: Int = 1600): Bitmap {
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val canvas = AndroidCanvas(bitmap)
-    canvas.drawColor(AndroidColor.WHITE)
-    // Draw light ruled notebook lines
-    val linePaint = AndroidPaint().apply {
-        color = AndroidColor.rgb(220, 230, 242)
-        strokeWidth = 2f
-    }
-    for (y in 120 until height step 60) {
-        canvas.drawLine(60f, y.toFloat(), (width - 60).toFloat(), y.toFloat(), linePaint)
-    }
-    return bitmap
-}
-
-fun loadPdfPages(context: Context, uri: Uri): List<Bitmap> {
-    val pages = mutableListOf<Bitmap>()
-    try {
-        context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-            PdfRenderer(pfd).use { renderer ->
-                for (i in 0 until renderer.pageCount) {
-                    renderer.openPage(i).use { page ->
-                        val bitmap = Bitmap.createBitmap(
-                            page.width * 2,
-                            page.height * 2,
-                            Bitmap.Config.ARGB_8888
-                        )
-                        val canvas = AndroidCanvas(bitmap)
-                        canvas.drawColor(AndroidColor.WHITE)
-                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        pages.add(bitmap)
-                    }
-                }
-            }
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-    return pages
-}
-
-fun exportAnnotatedPdf(
-    context: Context,
-    destUri: Uri,
-    pageBitmaps: List<Bitmap>,
-    pageStrokes: Map<Int, List<InkStroke>>,
-    canvasSize: IntSize
-): Boolean {
-    return try {
-        val pdfDocument = PdfDocument()
-        pageBitmaps.forEachIndexed { index, pageBitmap ->
-            val pageInfo = PdfDocument.PageInfo.Builder(pageBitmap.width, pageBitmap.height, index + 1).create()
-            val page = pdfDocument.startPage(pageInfo)
-            val pdfCanvas = page.canvas
-
-            // 1. Draw the underlying PDF/Notepad page
-            pdfCanvas.drawBitmap(pageBitmap, 0f, 0f, null)
-
-            // 2. Draw the ink layer scaled to match the bitmap dimensions
-            val strokes = pageStrokes[index].orEmpty()
-            if (strokes.isNotEmpty() && canvasSize.width > 0 && canvasSize.height > 0) {
-                val inkBitmap = Bitmap.createBitmap(pageBitmap.width, pageBitmap.height, Bitmap.Config.ARGB_8888)
-                val inkCanvas = AndroidCanvas(inkBitmap)
-                val scaleX = pageBitmap.width.toFloat() / canvasSize.width.toFloat()
-                val scaleY = pageBitmap.height.toFloat() / canvasSize.height.toFloat()
-
-                strokes.forEach { stroke ->
-                    if (stroke.points.isNotEmpty()) {
-                        val paint = AndroidPaint().apply {
-                            isAntiAlias = true
-                            style = AndroidPaint.Style.STROKE
-                            strokeCap = AndroidPaint.Cap.ROUND
-                            strokeJoin = AndroidPaint.Join.ROUND
-                            strokeWidth = stroke.strokeWidth * ((scaleX + scaleY) / 2f)
-                            if (stroke.isEraser) {
-                                xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-                            } else {
-                                color = stroke.color.toArgb()
-                            }
-                        }
-                        val path = android.graphics.Path().apply {
-                            moveTo(stroke.points.first().x * scaleX, stroke.points.first().y * scaleY)
-                            for (i in 1 until stroke.points.size) {
-                                lineTo(stroke.points[i].x * scaleX, stroke.points[i].y * scaleY)
-                            }
-                        }
-                        inkCanvas.drawPath(path, paint)
-                    }
-                }
-                pdfCanvas.drawBitmap(inkBitmap, 0f, 0f, null)
-            }
-            pdfDocument.finishPage(page)
-        }
-
-        context.contentResolver.openOutputStream(destUri)?.use { out ->
-            pdfDocument.writeTo(out)
-        }
-        pdfDocument.close()
-        true
-    } catch (e: Exception) {
-        e.printStackTrace()
-        false
-    }
-}
+                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    } else if (pressedCount == 1 && !isMultiTouchZooming &&
+                                        (activeTool == ActiveTool.PEN || activeTool == ActiveTool.ERASER)
+                                    ) {
+                                        val change = event.changes.firstOrNull {
